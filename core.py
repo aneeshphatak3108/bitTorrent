@@ -137,6 +137,7 @@ class Node:
         self.sock.bind((self.ip, self.port))
 
     #Core RPC function....everyting is built on top of this helper function
+    '''
     def send_rpc(self, ip, port, message):
         try:
             self.sock.sendto(json.dumps(message).encode(), (ip, port))
@@ -145,40 +146,58 @@ class Node:
             return json.loads(data.decode())
         except:
             return None
+    '''
+    def send_rpc(self, ip, port, message):
+        try:
+            temp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            temp_sock.settimeout(2)
+
+            temp_sock.sendto(json.dumps(message).encode(), (ip, port))
+            data, _ = temp_sock.recvfrom(4096)
+
+            temp_sock.close()
+            return json.loads(data.decode())
+
+        except:
+            return None
+
 
 
     #OUTGOING RPC (like client, initiates communication)
     def ping(self, node_id, ip, port):
         response = self.send_rpc(ip, port, {
             "type": "ping",
-            "node_id": self.node_id
+            "node_id": self.node_id,
+            "port": self.port
         })
         if response:
-            self.routing_table.add_node(node_id, ip, port, self.ping_node)
+            self.routing_table.add_node(node_id, ip, port, self.ping)
         return response
 
     def find_node(self, node_id, ip, port, target_id):
         response = self.send_rpc(ip, port, {
             "type": "find_node",
             "node_id": self.node_id,
-            "target_id": target_id
+            "target_id": target_id,
+            "port": self.port
         })
         if response and "nodes" in response:
             for n_id, n_ip, n_port in response["nodes"]:
-                self.routing_table.add_node(n_id, n_ip, n_port, self.ping_node)
+                self.routing_table.add_node(n_id, n_ip, n_port, self.ping)
         return response
 
     def get_peers(self, node_id, ip, port, info_hash):
         response = self.send_rpc(ip, port, {
             "type": "get_peers",
             "node_id": self.node_id,
-            "info_hash": info_hash
+            "info_hash": info_hash,
+            "port": self.port
         })
         #if "values" was in response then the peers are found....if "nodes" then this means i just got some nodes who were closer to the info_hash
         #so just add them to my routing table
         if response and "nodes" in response:
             for n_id, n_ip, n_port in response["nodes"]:
-                self.routing_table.add_node(n_id, n_ip, n_port, self.ping_node)
+                self.routing_table.add_node(n_id, n_ip, n_port, self.ping)
         return response
 
     def announce_peer(self, node_id, ip, port, info_hash):
@@ -193,11 +212,11 @@ class Node:
 
     #INCOMING RPCs (like server, gives response)
     def handle_ping(self, sender_node_id, sender_ip, sender_port):
-        self.routing_table.add_node(sender_node_id, sender_ip, sender_port, self.ping_node)
+        self.routing_table.add_node(sender_node_id, sender_ip, sender_port, self.ping)
         return {"node_id": self.node_id}
 
     def handle_find_node(self, sender_node_id, sender_ip, sender_port, target_id):
-        self.routing_table.add_node(sender_node_id, sender_ip, sender_port, self.ping_node)
+        self.routing_table.add_node(sender_node_id, sender_ip, sender_port, self.ping)
         closest = self.routing_table.get_closest_nodes(
             target_id, self.routing_table.k
         )
@@ -206,7 +225,7 @@ class Node:
         }
 
     def handle_get_peers(self, sender_node_id, sender_ip, sender_port, info_hash):
-        self.routing_table.add_node(sender_node_id, sender_ip, sender_port, self.ping_node)
+        self.routing_table.add_node(sender_node_id, sender_ip, sender_port, self.ping)
         if info_hash in self.local_storage:
             return {"values": self.local_storage[info_hash]}
         else:
@@ -217,7 +236,7 @@ class Node:
 
 
     def handle_announce_peer(self, sender_node_id, sender_ip, sender_port, info_hash, peer_port):
-        self.routing_table.add_node(sender_node_id, sender_ip, sender_port, self.ping_node)
+        self.routing_table.add_node(sender_node_id, sender_ip, sender_port, self.ping)
         closest = self.routing_table.get_closest_nodes(
             info_hash, self.routing_table.k
         )
@@ -234,6 +253,7 @@ class Node:
 
 
     #Looks at the recieved message and decides which function to call
+    '''
     def handle_incoming(self, data, addr):
         message = json.loads(data.decode())
         sender_ip, sender_port = addr
@@ -263,12 +283,66 @@ class Node:
         else:
             return
         self.sock.sendto(json.dumps(response).encode(), addr)
+'''
 
+    def handle_incoming(self, data, addr):
+        message = json.loads(data.decode())
+        #sender_ip, sender_port = addr
+        sender_ip = addr[0]
+        sender_port = message.get("port")
+        sender_node_id = message.get("node_id")
+
+        msg_type = message.get("type")
+        if not msg_type:
+            return
+
+        if msg_type == "ping":
+            response = self.handle_ping(sender_node_id, sender_ip, sender_port)
+
+        elif msg_type == "find_node":
+            response = self.handle_find_node(
+                sender_node_id, sender_ip, sender_port,
+                message["target_id"]
+            )
+
+        elif msg_type == "get_peers":
+            response = self.handle_get_peers(
+                sender_node_id, sender_ip, sender_port,
+                message["info_hash"]
+            )
+
+        elif msg_type == "announce_peer":
+            response = self.handle_announce_peer(
+                sender_node_id, sender_ip, sender_port,
+                message["info_hash"],
+                message["port"]
+            )
+        else:
+            return
+
+        self.sock.sendto(json.dumps(response).encode(), addr)
+
+    '''      
     def start_dht_listener(self):
         def listen():
             while True:
                 data, addr = self.sock.recvfrom(4096)
                 self.handle_incoming(data, addr)
+
+        thread = threading.Thread(target=listen, daemon=True)
+        thread.start()
+    '''
+    
+    def start_dht_listener(self):
+        def listen():
+            while True:
+                try:
+                    data, addr = self.sock.recvfrom(4096)
+                    self.handle_incoming(data, addr)
+                except socket.timeout:
+                    continue
+                except Exception:
+                    continue
 
         thread = threading.Thread(target=listen, daemon=True)
         thread.start()
@@ -283,14 +357,14 @@ class Node:
             to_query = [n for n in closest if n[0] not in queried][:alpha]
             if not to_query:
                 break
-            for node_id, ip, port in to_query:
+            for node_id, ip, port, *_ in to_query:
                 queried.add(node_id)
                 response = self.find_node(node_id, ip, port, target_id)
                 if response and "nodes" in response:
                     new_nodes.extend(response["nodes"])
 
             for n_id, n_ip, n_port in new_nodes:
-                self.routing_table.add_node(n_id, n_ip, n_port, self.ping_node)
+                self.routing_table.add_node(n_id, n_ip, n_port, self.ping)
             updated = self.routing_table.get_closest_nodes(target_id, self.routing_table.k)
             if updated == closest:
                 break
@@ -306,7 +380,7 @@ class Node:
             if not to_query:
                 break
 
-            for node_id, ip, port in to_query:
+            for node_id, ip, port, *_ in to_query:
                 queried.add(node_id)
                 response = self.get_peers(node_id, ip, port, info_hash)
                 if not response:
@@ -315,7 +389,7 @@ class Node:
                     found_peers.extend(response["values"])
                 if "nodes" in response:
                     for n_id, n_ip, n_port in response["nodes"]:
-                        self.routing_table.add_node(n_id, n_ip, n_port, self.ping_node)
+                        self.routing_table.add_node(n_id, n_ip, n_port, self.ping)
 
             updated = self.routing_table.get_closest_nodes(info_hash, self.routing_table.k)
             if updated == closest:
