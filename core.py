@@ -136,6 +136,15 @@ class Node:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind((self.ip, self.port))
 
+
+    def bootstrap(self):
+        for ip, port in self.bootstrap_nodes:
+            response = self.ping(None, ip, port)
+            if response:
+                self.routing_table.add_node(
+                    response["node_id"], ip, port, self.ping_node
+                )
+
     #Core RPC function....everyting is built on top of this helper function
     '''
     def send_rpc(self, ip, port, message):
