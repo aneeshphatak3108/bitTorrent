@@ -165,7 +165,7 @@ class Node:
         message = json.loads(data.decode())
         #sender_ip, sender_port = addr
         sender_ip = addr[0]
-        sender_port = addr[1]
+        sender_port = message.get("port", addr[1])
         sender_node_id = message.get("node_id")
 
         msg_type = message.get("type")
@@ -205,6 +205,8 @@ class Node:
                 try:
                     data, addr = self.sock.recvfrom(4096)
                     self.handle_incoming(data, addr)
+                except socket.timeout:
+                    continue   # normal, no packet arrived
                 except Exception as e:
                     print("DHT listener error:", e)
         thread = threading.Thread(target=listen, daemon=True)
