@@ -3,6 +3,269 @@ import random
 import json
 import socket
 import threading
+class Node:
+    def __init__(self, ip, port, bootstrap_nodes=None):
+        self.ip = ip
+        self.port = port
+        self.node_id = random.getrandbits(160)
+        #DHT stuff
+        self.routing_table = RoutingTable(self.node_id)
+        self.local_storage = {} #info_hash -> [(ip, port)]
+        self.bootstrap_nodes = bootstrap_nodes or []
+        #networking stuff
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind((self.ip, self.port))
+        self.sock.settimeout(1)
+        #all active connections this node has rt now (its swarm)
+        self.peers = {}
+        #storage information of pieces of desired file
+        self.storage = None
+        self.active_info_hash = None
+
+
+    def maintain_dht(self):
+        while True:
+            random_id = random.getrandbits(160)
+            self.iterative_find_node(random_id)
+            if self.active_info_hash:
+                self.iterative_announce_peer(self.active_info_hash)
+            time.sleep(900)
+
+
+    def bootstrap(self):
+        for ip, port in self.bootstrap_nodes:
+            response = self.ping(ip, port)
+            if response and "node_id" in response:
+                self.routing_table.add_node(
+                    response["node_id"], ip, port, self.ping
+                )
+        self.iterative_find_node(self.node_id)#swatahala shodhnyachya nimittani dht cha part banto
+
+    #Core RPC function....everyting is built on top of this helper function
+    #any function that wants to send data, sends data through this function
+    '''
+    def send_rpc(self, ip, port, message):
+        try:
+            temp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            temp_sock.sendto(json.dumps(message).encode(), (ip, port))
+            temp_sock.settimeout(2)
+            data, _ = temp_sock.recvfrom(4096)
+            temp_sock.close()
+            return json.loads(data.decode())
+        except:
+            return None
+    '''
+    def send_rpc(self, ip, port, message):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as temp_sock:
+                temp_sock.sendto(json.dumps(message).encode(), (ip, port))
+                temp_sock.settimeout(2)
+                data, _ = temp_sock.recvfrom(4096)
+                return json.loads(data.decode())
+        except:
+            return None
+
+
+    #OUTGOING RPC (like client, initiates communication)
+    def ping(self, ip, port):
+        return self.send_rpc(ip, port, {
+            "type": "ping",
+            "node_id": self.node_id,
+            "port": self.port
+        })
+
+    def find_node(self, node_id, ip, port, target_id):
+        response = self.send_rpc(ip, port, {
+            "type": "find_node",
+            "node_id": self.node_id,
+            "target_id": target_id,
+            "port": self.port
+        })
+        if response and "nodes" in response:
+            for n_id, n_ip, n_port in response["nodes"]:
+                self.routing_table.add_node(n_id, n_ip, n_port, self.ping)
+        return response
+
+    def get_peers(self, node_id, ip, port, info_hash):
+        response = self.send_rpc(ip, port, {
+            "type": "get_peers",
+            "node_id": self.node_id,
+            "info_hash": info_hash,
+            "port": self.port
+        })
+        #if "values" was in response then the peers are found....if "nodes" then this means i just got some nodes who were closer to the info_hash
+        #so just add them to my routing table
+        if response and "nodes" in response:
+            for n_id, n_ip, n_port in response["nodes"]:
+                self.routing_table.add_node(n_id, n_ip, n_port, self.ping)
+        return response
+
+
+    #so bootstrap() is for joining the dht and announce_peer() is for joining the swarm of peers
+    def announce_peer(self, ip, port, info_hash):
+        return self.send_rpc(ip, port, {
+            "type": "announce_peer",
+            "node_id": self.node_id,
+            "info_hash": info_hash,
+            "port": self.port
+        })
+
+
+
+    #INCOMING RPCs (like server, gives response)
+    def handle_ping(self, sender_node_id, sender_ip, sender_port):
+        self.routing_table.add_node(sender_node_id, sender_ip, sender_port, self.ping)
+        return {"node_id": self.node_id}
+
+    def handle_find_node(self, sender_node_id, sender_ip, sender_port, target_id):
+        self.routing_table.add_node(sender_node_id, sender_ip, sender_port, self.ping)
+        closest = self.routing_table.get_closest_nodes(
+            target_id, self.routing_table.k
+        )
+        return {
+            "nodes": [(n[0], n[1], n[2]) for n in closest]
+        }
+
+    def handle_get_peers(self, sender_node_id, sender_ip, sender_port, info_hash):
+        self.routing_table.add_node(sender_node_id, sender_ip, sender_port, self.ping)
+        if info_hash in self.local_storage:
+            return {"values": self.local_storage[info_hash]}
+        else:
+            closest = self.routing_table.get_closest_nodes(
+                info_hash, self.routing_table.k
+            )
+            return {"nodes": [(n[0], n[1], n[2]) for n in closest]}
+
+
+    def iterative_announce_peer(self, info_hash):
+        closest_nodes = self.iterative_find_node(info_hash)
+        for node in closest_nodes:
+            node_id, ip, port, *_ = node
+            self.announce_peer(ip, port, info_hash)
+
+
+    def handle_announce_peer(self, sender_node_id, sender_ip, sender_port, info_hash, peer_port):
+        self.routing_table.add_node(sender_node_id, sender_ip, sender_port, self.ping)
+        closest = self.routing_table.get_closest_nodes(
+            info_hash, self.routing_table.k
+        )# a k-bucket basically
+        my_distance = self.node_id ^ info_hash
+        farthest = max((n[0] ^ info_hash) for n in closest) if closest else float('inf')
+        #am i responsible for storing this info_hash file's peer list???
+        if my_distance <= farthest:
+            if info_hash not in self.local_storage:
+                self.local_storage[info_hash] = []
+            peer_entry = (sender_ip, peer_port)
+            if peer_entry not in self.local_storage[info_hash]:
+                self.local_storage[info_hash].append(peer_entry)
+        return {"status": "ok"}
+
+
+    def handle_incoming(self, data, addr):
+        message = json.loads(data.decode())
+        #sender_ip, sender_port = addr
+        sender_ip = addr[0]
+        sender_port = addr[1]
+        sender_node_id = message.get("node_id")
+
+        msg_type = message.get("type")
+        if not msg_type:
+            return
+
+        if msg_type == "ping":
+            response = self.handle_ping(sender_node_id, sender_ip, sender_port)
+
+        elif msg_type == "find_node":
+            response = self.handle_find_node(
+                sender_node_id, sender_ip, sender_port,
+                message["target_id"]
+            )
+
+        elif msg_type == "get_peers":
+            response = self.handle_get_peers(
+                sender_node_id, sender_ip, sender_port,
+                message["info_hash"]
+            )
+
+        elif msg_type == "announce_peer":
+            response = self.handle_announce_peer(
+                sender_node_id, sender_ip, sender_port,
+                message["info_hash"],
+                message["port"]
+            )
+        else:
+            return
+        self.sock.sendto(json.dumps(response).encode(), addr)
+    
+
+    #THESE GUYS ARE THE BEST AND MOST IMPORTANT
+    def start_dht_listener(self):
+        def listen():
+            while True:
+                try:
+                    data, addr = self.sock.recvfrom(4096)
+                    self.handle_incoming(data, addr)
+                except Exception as e:
+                    print("DHT listener error:", e)
+        thread = threading.Thread(target=listen, daemon=True)
+        thread.start()
+
+
+    def start_dht_maintenance(self):
+        thread = threading.Thread(target=self.maintain_dht, daemon=True)
+        thread.start()
+
+
+    #Iterative lookup, alpha decides the breadth(eka veli 3 nodes na query karto)
+    #this function will be used in bootstrapping and essentially a node is going to find itself using the bootstrapped nodes and 
+    #in the process is going to become a part of the dht
+    def iterative_find_node(self, target_id, alpha=3):
+        queried = set()
+        closest = self.routing_table.get_closest_nodes(target_id, self.routing_table.k)
+        while True:
+            new_nodes = []
+            to_query = [n for n in closest if n[0] not in queried][:alpha] #slicing the list
+            if not to_query:
+                break
+            for node_id, ip, port, *_ in to_query:
+                queried.add(node_id)
+                response = self.find_node(node_id, ip, port, target_id)
+                if response and "nodes" in response:
+                    new_nodes.extend(response["nodes"])
+
+            for n_id, n_ip, n_port in new_nodes:
+                self.routing_table.add_node(n_id, n_ip, n_port, self.ping)
+            updated = self.routing_table.get_closest_nodes(target_id, self.routing_table.k)
+            if [n[0] for n in updated] == [n[0] for n in closest]:
+                break
+            closest = updated
+        return closest
+
+    def iterative_get_peers(self, info_hash, alpha=3):
+        queried = set()
+        closest = self.routing_table.get_closest_nodes(info_hash, self.routing_table.k)
+        found_peers = []
+        while True:
+            to_query = [n for n in closest if n[0] not in queried][:alpha]
+            if not to_query:
+                break
+            for node_id, ip, port, *_ in to_query:
+                queried.add(node_id)
+                response = self.get_peers(node_id, ip, port, info_hash)
+                if not response:
+                    continue
+                #this part is the only difference b/w iterative_get_peers and iterative_find_node
+                if "values" in response:
+                    found_peers.extend(response["values"])
+                if "nodes" in response:
+                    for n_id, n_ip, n_port in response["nodes"]:
+                        self.routing_table.add_node(n_id, n_ip, n_port, self.ping)
+            updated = self.routing_table.get_closest_nodes(info_hash, self.routing_table.k)
+            if [n[0] for n in updated] == [n[0] for n in closest]:
+                break
+            closest = updated
+        return found_peers
+
 
 #this is going to be a part of every node object (a dictionary of the peer-list peer_id ---> peerconnection)
 class PeerConnection:
@@ -16,10 +279,8 @@ class PeerConnection:
         self.am_interested = False
         self.peer_choking = True
         self.peer_interested = False
-
         self.download_rate = 0
         self.upload_rate = 0
-
         self.pending_requests = {}  #key-value pairs stored as (piece, block)--->timestamp
         self.last_active = time.time()
 
@@ -32,7 +293,7 @@ class Storage:
     def __init__(self, total_pieces, piece_length, piece_hashes):
         self.total_pieces = total_pieces
         self.piece_length = piece_length
-        self.piece_hashes = piece_hashes  #[SHA1(piece_0), SHA1(piece_1), ..., SHA1(piece_1023)]
+        self.piece_hashes = piece_hashes 
         self.my_bitfield = [0] * total_pieces
         self.block_status = {}  # piece_index -> list of block states
         '''
@@ -98,7 +359,6 @@ class KBucket:
             self.nodes.append((node_id, ip, port, time.time()))
 
 
-
 class RoutingTable:
     def __init__(self, node_id, k=8, id_bits=160):
         self.node_id = node_id
@@ -121,287 +381,3 @@ class RoutingTable:
             all_nodes.extend(bucket.nodes)
         all_nodes.sort(key=lambda node: node[0] ^ target_id)
         return all_nodes[:k]
-
-
-class Node:
-    def __init__(self, ip, port, bootstrap_nodes=None):
-        self.ip = ip
-        self.port = port
-        self.node_id = random.getrandbits(160)
-        #DHT stuff
-        self.routing_table = RoutingTable(self.node_id)
-        self.local_storage = {}  # info_hash -> [(ip, port)]
-        self.bootstrap_nodes = bootstrap_nodes or []
-
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind((self.ip, self.port))
-
-
-    def bootstrap(self):
-        for ip, port in self.bootstrap_nodes:
-            response = self.ping(None, ip, port)
-            if response:
-                self.routing_table.add_node(
-                    response["node_id"], ip, port, self.ping_node
-                )
-
-    #Core RPC function....everyting is built on top of this helper function
-    '''
-    def send_rpc(self, ip, port, message):
-        try:
-            self.sock.sendto(json.dumps(message).encode(), (ip, port))
-            self.sock.settimeout(2)
-            data, _ = self.sock.recvfrom(4096)
-            return json.loads(data.decode())
-        except:
-            return None
-    '''
-    def send_rpc(self, ip, port, message):
-        try:
-            temp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            temp_sock.settimeout(2)
-
-            temp_sock.sendto(json.dumps(message).encode(), (ip, port))
-            data, _ = temp_sock.recvfrom(4096)
-
-            temp_sock.close()
-            return json.loads(data.decode())
-
-        except:
-            return None
-
-
-
-    #OUTGOING RPC (like client, initiates communication)
-    def ping(self, node_id, ip, port):
-        response = self.send_rpc(ip, port, {
-            "type": "ping",
-            "node_id": self.node_id,
-            "port": self.port
-        })
-        if response:
-            self.routing_table.add_node(node_id, ip, port, self.ping)
-        return response
-
-    def find_node(self, node_id, ip, port, target_id):
-        response = self.send_rpc(ip, port, {
-            "type": "find_node",
-            "node_id": self.node_id,
-            "target_id": target_id,
-            "port": self.port
-        })
-        if response and "nodes" in response:
-            for n_id, n_ip, n_port in response["nodes"]:
-                self.routing_table.add_node(n_id, n_ip, n_port, self.ping)
-        return response
-
-    def get_peers(self, node_id, ip, port, info_hash):
-        response = self.send_rpc(ip, port, {
-            "type": "get_peers",
-            "node_id": self.node_id,
-            "info_hash": info_hash,
-            "port": self.port
-        })
-        #if "values" was in response then the peers are found....if "nodes" then this means i just got some nodes who were closer to the info_hash
-        #so just add them to my routing table
-        if response and "nodes" in response:
-            for n_id, n_ip, n_port in response["nodes"]:
-                self.routing_table.add_node(n_id, n_ip, n_port, self.ping)
-        return response
-
-    def announce_peer(self, node_id, ip, port, info_hash):
-        return self.send_rpc(ip, port, {
-            "type": "announce_peer",
-            "node_id": self.node_id,
-            "info_hash": info_hash,
-            "port": self.port
-        })
-
-
-
-    #INCOMING RPCs (like server, gives response)
-    def handle_ping(self, sender_node_id, sender_ip, sender_port):
-        self.routing_table.add_node(sender_node_id, sender_ip, sender_port, self.ping)
-        return {"node_id": self.node_id}
-
-    def handle_find_node(self, sender_node_id, sender_ip, sender_port, target_id):
-        self.routing_table.add_node(sender_node_id, sender_ip, sender_port, self.ping)
-        closest = self.routing_table.get_closest_nodes(
-            target_id, self.routing_table.k
-        )
-        return {
-            "nodes": [(n[0], n[1], n[2]) for n in closest]
-        }
-
-    def handle_get_peers(self, sender_node_id, sender_ip, sender_port, info_hash):
-        self.routing_table.add_node(sender_node_id, sender_ip, sender_port, self.ping)
-        if info_hash in self.local_storage:
-            return {"values": self.local_storage[info_hash]}
-        else:
-            closest = self.routing_table.get_closest_nodes(
-                info_hash, self.routing_table.k
-            )
-            return {"nodes": [(n[0], n[1], n[2]) for n in closest]}
-
-
-    def handle_announce_peer(self, sender_node_id, sender_ip, sender_port, info_hash, peer_port):
-        self.routing_table.add_node(sender_node_id, sender_ip, sender_port, self.ping)
-        closest = self.routing_table.get_closest_nodes(
-            info_hash, self.routing_table.k
-        )
-        my_distance = self.node_id ^ info_hash
-        farthest = max((n[0] ^ info_hash) for n in closest) if closest else float('inf')
-        if my_distance <= farthest:
-            if info_hash not in self.local_storage:
-                self.local_storage[info_hash] = []
-            peer_entry = (sender_ip, peer_port)
-            if peer_entry not in self.local_storage[info_hash]:
-                self.local_storage[info_hash].append(peer_entry)
-        return {"status": "ok"}
-
-
-
-    #Looks at the recieved message and decides which function to call
-    '''
-    def handle_incoming(self, data, addr):
-        message = json.loads(data.decode())
-        sender_ip, sender_port = addr
-        sender_node_id = message.get("node_id")
-
-        if message["type"] == "ping":
-            response = self.handle_ping(sender_node_id, sender_ip, sender_port)
-
-        elif message["type"] == "find_node":
-            response = self.handle_find_node(
-                sender_node_id, sender_ip, sender_port,
-                message["target_id"]
-            )
-
-        elif message["type"] == "get_peers":
-            response = self.handle_get_peers(
-                sender_node_id, sender_ip, sender_port,
-                message["info_hash"]
-            )
-
-        elif message["type"] == "announce_peer":
-            response = self.handle_announce_peer(
-                sender_node_id, sender_ip, sender_port,
-                message["info_hash"],
-                message["port"]
-            )
-        else:
-            return
-        self.sock.sendto(json.dumps(response).encode(), addr)
-'''
-
-    def handle_incoming(self, data, addr):
-        message = json.loads(data.decode())
-        #sender_ip, sender_port = addr
-        sender_ip = addr[0]
-        sender_port = message.get("port")
-        sender_node_id = message.get("node_id")
-
-        msg_type = message.get("type")
-        if not msg_type:
-            return
-
-        if msg_type == "ping":
-            response = self.handle_ping(sender_node_id, sender_ip, sender_port)
-
-        elif msg_type == "find_node":
-            response = self.handle_find_node(
-                sender_node_id, sender_ip, sender_port,
-                message["target_id"]
-            )
-
-        elif msg_type == "get_peers":
-            response = self.handle_get_peers(
-                sender_node_id, sender_ip, sender_port,
-                message["info_hash"]
-            )
-
-        elif msg_type == "announce_peer":
-            response = self.handle_announce_peer(
-                sender_node_id, sender_ip, sender_port,
-                message["info_hash"],
-                message["port"]
-            )
-        else:
-            return
-
-        self.sock.sendto(json.dumps(response).encode(), addr)
-
-    '''      
-    def start_dht_listener(self):
-        def listen():
-            while True:
-                data, addr = self.sock.recvfrom(4096)
-                self.handle_incoming(data, addr)
-
-        thread = threading.Thread(target=listen, daemon=True)
-        thread.start()
-    '''
-    
-    def start_dht_listener(self):
-        def listen():
-            while True:
-                try:
-                    data, addr = self.sock.recvfrom(4096)
-                    self.handle_incoming(data, addr)
-                except socket.timeout:
-                    continue
-                except Exception:
-                    continue
-
-        thread = threading.Thread(target=listen, daemon=True)
-        thread.start()
-
-
-    #Iterative lookup, alpha decides the breadth
-    def iterative_find_node(self, target_id, alpha=3):
-        queried = set()
-        closest = self.routing_table.get_closest_nodes(target_id, self.routing_table.k)
-        while True:
-            new_nodes = []
-            to_query = [n for n in closest if n[0] not in queried][:alpha]
-            if not to_query:
-                break
-            for node_id, ip, port, *_ in to_query:
-                queried.add(node_id)
-                response = self.find_node(node_id, ip, port, target_id)
-                if response and "nodes" in response:
-                    new_nodes.extend(response["nodes"])
-
-            for n_id, n_ip, n_port in new_nodes:
-                self.routing_table.add_node(n_id, n_ip, n_port, self.ping)
-            updated = self.routing_table.get_closest_nodes(target_id, self.routing_table.k)
-            if updated == closest:
-                break
-            closest = updated
-        return closest
-
-    def iterative_get_peers(self, info_hash, alpha=3):
-        queried = set()
-        closest = self.routing_table.get_closest_nodes(info_hash, self.routing_table.k)
-        found_peers = []
-        while True:
-            to_query = [n for n in closest if n[0] not in queried][:alpha]
-            if not to_query:
-                break
-
-            for node_id, ip, port, *_ in to_query:
-                queried.add(node_id)
-                response = self.get_peers(node_id, ip, port, info_hash)
-                if not response:
-                    continue
-                if "values" in response:
-                    found_peers.extend(response["values"])
-                if "nodes" in response:
-                    for n_id, n_ip, n_port in response["nodes"]:
-                        self.routing_table.add_node(n_id, n_ip, n_port, self.ping)
-
-            updated = self.routing_table.get_closest_nodes(info_hash, self.routing_table.k)
-            if updated == closest:
-                break
-            closest = updated
-        return found_peers
